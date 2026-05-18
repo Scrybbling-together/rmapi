@@ -13,7 +13,9 @@ type Document struct {
 	ModifiedClient string
 	Type           string
 	CurrentPage    int
+	Starred        bool
 	Parent         string
+	Tags           []string
 }
 
 type BlobRootStorageRequest struct {

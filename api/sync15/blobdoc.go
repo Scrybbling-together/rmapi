@@ -22,6 +22,7 @@ type BlobDoc struct {
 	Files []*Entry
 	Entry
 	Metadata archive.MetadataFile
+	Content  archive.Content
 }
 
 func NewBlobDoc(name, documentId, colType, parentId string) *BlobDoc {
@@ -95,14 +96,23 @@ func (t *HashTree) Add(d *BlobDoc) error {
 }
 
 func (d *BlobDoc) IndexReader() (io.Reader, error) {
+	return d.IndexReaderWithSchema("")
+}
+
+func (d *BlobDoc) IndexReaderWithSchema(schema string) (io.Reader, error) {
 	if len(d.Files) == 0 {
 		return nil, errors.New("no files")
 	}
+
+	if schema == "" {
+		schema = SchemaVersionV3
+	}
+
 	var w bytes.Buffer
-	w.WriteString(SchemaVersionV3)
+	w.WriteString(schema)
 	w.WriteString("\n")
-	for _, d := range d.Files {
-		w.WriteString(d.Line())
+	for _, f := range d.Files {
+		w.WriteString(f.Line())
 		w.WriteString("\n")
 	}
 
@@ -133,17 +143,63 @@ func (d *BlobDoc) ReadMetadata(fileEntry *Entry, r RemoteStorage) error {
 		d.Metadata = metadata
 	}
 
+	if strings.HasSuffix(fileEntry.DocumentID, ".content") {
+		log.Trace.Println("Reading content: " + d.DocumentID)
+
+		contentData := archive.Content{}
+
+		contentReader, err := r.GetReader(fileEntry.Hash, fileEntry.DocumentID)
+		if err != nil {
+			log.Warning.Printf("cannot get content reader %s: %v", fileEntry.DocumentID, err)
+			return nil
+		}
+		defer contentReader.Close()
+
+		contentBytes, err := io.ReadAll(contentReader)
+		if err != nil {
+			log.Warning.Printf("cannot read content bytes %s: %v", fileEntry.DocumentID, err)
+			return nil
+		}
+
+		err = json.Unmarshal(contentBytes, &contentData)
+		if err != nil {
+			log.Warning.Printf("cannot parse content JSON %s: %v", fileEntry.DocumentID, err)
+			return nil
+		}
+
+		// Ensure nil slices become empty arrays
+		if contentData.DocumentTags == nil {
+			contentData.DocumentTags = []archive.Tag{}
+		}
+		if contentData.PageTags == nil {
+			contentData.PageTags = []archive.PageTag{}
+		}
+
+		log.Trace.Printf("parsed content for %s: %d document tags, %d page tags",
+			d.DocumentID, len(contentData.DocumentTags), len(contentData.PageTags))
+		d.Content = contentData
+	}
+
 	return nil
 }
 
 func (d *BlobDoc) Line() string {
+	return d.LineWithSchema("")
+}
+
+func (d *BlobDoc) LineWithSchema(schema string) string {
 	var sb strings.Builder
 	if d.Hash == "" {
 		log.Error.Print("missing hash for: ", d.DocumentID)
 	}
 	sb.WriteString(d.Hash)
 	sb.WriteRune(Delimiter)
-	sb.WriteString(DocType)
+
+	typeField := FileType
+	if schema == SchemaVersionV3 {
+		typeField = DocType
+	}
+	sb.WriteString(typeField)
 	sb.WriteRune(Delimiter)
 	sb.WriteString(d.DocumentID)
 	sb.WriteRune(Delimiter)
@@ -163,7 +219,7 @@ func (d *BlobDoc) Mirror(e *Entry, r RemoteStorage) error {
 		return err
 	}
 	defer entryIndex.Close()
-	entries, err := parseIndex(entryIndex)
+	entries, _, err := parseIndex(entryIndex)
 	if err != nil {
 		return fmt.Errorf("blobdoc index error %v", err)
 	}
@@ -218,6 +274,12 @@ func (d *BlobDoc) ToDocument() *model.Document {
 		t := time.Unix(unixTime/1000, 0)
 		lastModified = t.UTC().Format(time.RFC3339Nano)
 	}
+
+	tags := []string{}
+	for _, tag := range d.Content.DocumentTags {
+		tags = append(tags, tag.Name)
+	}
+
 	return &model.Document{
 		ID:             d.DocumentID,
 		Name:           d.Metadata.DocName,
@@ -225,6 +287,8 @@ func (d *BlobDoc) ToDocument() *model.Document {
 		Parent:         d.Metadata.Parent,
 		Type:           d.Metadata.CollectionType,
 		CurrentPage:    d.Metadata.LastOpenedPage,
+		Starred:        d.Metadata.Pinned,
 		ModifiedClient: lastModified,
+		Tags:           tags,
 	}
 }
