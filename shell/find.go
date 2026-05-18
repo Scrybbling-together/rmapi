@@ -9,25 +9,49 @@ import (
 	"github.com/abiosoft/ishell"
 	"github.com/juruen/rmapi/filetree"
 	"github.com/juruen/rmapi/model"
-	flag "github.com/ogier/pflag"
+	"github.com/ogier/pflag"
 )
 
+// tagSlice implements flag.Value to collect multiple --tag flags
+type tagSlice []string
+
+func (t *tagSlice) String() string {
+	return strings.Join(*t, ",")
+}
+
+func (t *tagSlice) Set(value string) error {
+	*t = append(*t, value)
+	return nil
+}
+
 func findCmd(ctx *ShellCtxt) *ishell.Cmd {
+	longHelp := `Usage: find [options] [dir] [regexp]`
+
 	return &ishell.Cmd{
 		Name:      "find",
-		Help:      "find files recursively, usage: find dir [regexp]",
+		Help:      "find files recursively",
 		Completer: createDirCompleter(ctx),
+		LongHelp:  longHelp,
 		Func: func(c *ishell.Context) {
-			flagSet := flag.NewFlagSet("ls", flag.ContinueOnError)
+			flagSet := pflag.NewFlagSet("find", pflag.ContinueOnError)
 			var compact bool
+			var tags tagSlice
+			var starred bool
 			flagSet.BoolVarP(&compact, "compact", "c", false, "compact format")
-			if err := flagSet.Parse(c.Args); err != nil {
-				if err != flag.ErrHelp {
-					c.Err(err)
-				}
+			flagSet.Var(&tags, "tag", "filter by tag (can be specified multiple times, matches files with ANY of the tags)")
+			flagSet.BoolVar(&starred, "starred", false, "only show starred files")
+			if !processFlagSet(flagSet, longHelp, c.Args, c) {
 				return
 			}
 			argRest := flagSet.Args()
+
+			starredFilterEnabled := false
+			flagSet.Visit(func(f *pflag.Flag) {
+				if f.Name == "starred" {
+					starredFilterEnabled = true
+				}
+			})
+
 			var start, pattern string
 			switch len(argRest) {
 			case 2:
@@ -38,7 +62,7 @@ func findCmd(ctx *ShellCtxt) *ishell.Cmd {
 			case 0:
 				start = ctx.path
 			default:
-				c.Err(errors.New("missing arguments; usage find [dir] [regexp]"))
+				c.Err(errors.New("missing arguments; usage find [options] [dir] [regexp]"))
 				return
 			}
 
@@ -58,24 +82,62 @@ func findCmd(ctx *ShellCtxt) *ishell.Cmd {
 				}
 			}
 
+			var matchedNodes []*model.Node
+			var matchedPaths [][]string
+
 			filetree.WalkTree(startNode, filetree.FileTreeVistor{
 				Visit: func(node *model.Node, path []string) bool {
+					// Filter by starred status if flag was set
+					if starredFilterEnabled && node.Document != nil {
+						if node.Document.Starred != starred {
+							return false
+						}
+					}
+
+					// Filter by tags if specified - using OR semantics
+					if len(tags) > 0 && node.Document != nil {
+						nodeTags := node.Document.Tags
+						hasMatch := false
+						for _, requiredTag := range tags {
+							for _, nodeTag := range nodeTags {
+								if nodeTag == requiredTag {
+									hasMatch = true
+									break
+								}
+							}
+							if hasMatch {
+								break
+							}
+						}
+						if !hasMatch {
+							return false
+						}
+					}
+
 					entryName := formatEntry(compact, path, node)
 
-					if matchRegexp == nil {
-						c.Println(entryName)
+					// Check regexp match if pattern is provided
+					if matchRegexp != nil && !matchRegexp.Match([]byte(entryName)) {
 						return false
 					}
 
-					if !matchRegexp.Match([]byte(entryName)) {
-						return false
-					}
-
-					c.Println(entryName)
+					matchedNodes = append(matchedNodes, node)
+					matchedPaths = append(matchedPaths, path)
 
 					return false
 				},
 			})
+
+			if ctx.JSONOutput {
+				if err := displayNodesJSON(c, matchedNodes); err != nil {
+					c.Err(err)
+				}
+			} else {
+				for i, node := range matchedNodes {
+					entryName := formatEntry(compact, matchedPaths[i], node)
+					c.Println(entryName)
+				}
+			}
 		},
 	}
 }
